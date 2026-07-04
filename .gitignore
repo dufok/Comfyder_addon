@@ -1,0 +1,4 @@
+render_pack/
+out/
+__pycache__/
+*.blend1

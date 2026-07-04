@@ -1,0 +1,319 @@
+{
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "depth0001.png"
+    },
+    "_meta": {
+      "title": "Вход: depth из Blender"
+    }
+  },
+  "2": {
+    "class_type": "FluxGeneral_fal",
+    "inputs": {
+      "prompt": "modern exhibition booth interior, professional architectural visualization, soft diffused daylight, clean minimalist design, photorealistic render, high detail, neutral color palette",
+      "image_size": "custom",
+      "width": 1344,
+      "height": 768,
+      "num_inference_steps": 28,
+      "guidance_scale": 3.0,
+      "real_cfg_scale": 3.3,
+      "num_images": 1,
+      "enable_safety_checker": false,
+      "use_real_cfg": false,
+      "sync_mode": false,
+      "seed": -1,
+      "controlnet_unions": "InstantX/FLUX.1-dev-Controlnet-Union",
+      "controlnet_union_control_mode": "depth",
+      "controlnet_conditioning_scale": 0.65,
+      "control_image": [
+        "1",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "1) Глобальный проход — стиль по depth"
+    }
+  },
+  "3": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "2",
+        0
+      ],
+      "filename_prefix": "b2r/00_global"
+    },
+    "_meta": {
+      "title": "Сейв 00: глобальный"
+    }
+  },
+  "4": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "mask_mat_wall0001.png"
+    },
+    "_meta": {
+      "title": "Вход: маска mat_wall"
+    }
+  },
+  "5": {
+    "class_type": "FluxPro1Fill_fal",
+    "inputs": {
+      "prompt": "smooth white painted drywall, subtle matte finish",
+      "num_images": 1,
+      "safety_tolerance": "5",
+      "output_format": "png",
+      "image": [
+        "2",
+        0
+      ],
+      "mask_image": [
+        "4",
+        0
+      ],
+      "seed": -1,
+      "sync_mode": false,
+      "enhance_prompt": false
+    },
+    "_meta": {
+      "title": "2.1) Inpaint текстом — mat_wall"
+    }
+  },
+  "6": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "5",
+        0
+      ],
+      "filename_prefix": "b2r/01_mat_wall"
+    },
+    "_meta": {
+      "title": "Сейв 01: mat_wall"
+    }
+  },
+  "7": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "mask_mat_floor0001.png"
+    },
+    "_meta": {
+      "title": "Вход: маска mat_floor"
+    }
+  },
+  "8": {
+    "class_type": "FluxPro1Fill_fal",
+    "inputs": {
+      "prompt": "light oak wood flooring, natural grain, satin finish",
+      "num_images": 1,
+      "safety_tolerance": "5",
+      "output_format": "png",
+      "image": [
+        "5",
+        0
+      ],
+      "mask_image": [
+        "7",
+        0
+      ],
+      "seed": -1,
+      "sync_mode": false,
+      "enhance_prompt": false
+    },
+    "_meta": {
+      "title": "2.2) Inpaint текстом — mat_floor"
+    }
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "8",
+        0
+      ],
+      "filename_prefix": "b2r/02_mat_floor"
+    },
+    "_meta": {
+      "title": "Сейв 02: mat_floor"
+    }
+  },
+  "10": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "mask_mat_counter0001.png"
+    },
+    "_meta": {
+      "title": "Вход: маска mat_counter"
+    }
+  },
+  "11": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "chrome.jpg"
+    },
+    "_meta": {
+      "title": "Вход: свотч mat_counter"
+    }
+  },
+  "12": {
+    "class_type": "NanoBananaEdit_fal",
+    "inputs": {
+      "prompt": "Apply the material and finish shown in the second image to the counter panels. polished chrome metal panels, mirror-like reflections. Keep the composition, camera, lighting and everything else exactly unchanged.",
+      "image_1": [
+        "8",
+        0
+      ],
+      "image_2": [
+        "11",
+        0
+      ],
+      "num_images": 1,
+      "output_format": "png"
+    },
+    "_meta": {
+      "title": "2.3) Edit по референсу — mat_counter"
+    }
+  },
+  "13": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": [
+        "12",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "width": 1344,
+      "height": 768,
+      "crop": "disabled"
+    },
+    "_meta": {
+      "title": "Подгон к размеру кадра"
+    }
+  },
+  "14": {
+    "class_type": "ImageToMask",
+    "inputs": {
+      "image": [
+        "10",
+        0
+      ],
+      "channel": "red"
+    },
+    "_meta": {
+      "title": "Маска mat_counter → MASK"
+    }
+  },
+  "15": {
+    "class_type": "ImageCompositeMasked",
+    "inputs": {
+      "destination": [
+        "8",
+        0
+      ],
+      "source": [
+        "13",
+        0
+      ],
+      "x": 0,
+      "y": 0,
+      "resize_source": false,
+      "mask": [
+        "14",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Врезка по маске — mat_counter"
+    }
+  },
+  "16": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "15",
+        0
+      ],
+      "filename_prefix": "b2r/03_mat_counter"
+    },
+    "_meta": {
+      "title": "Сейв 03: mat_counter"
+    }
+  },
+  "17": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "mask_mat_accent0001.png"
+    },
+    "_meta": {
+      "title": "Вход: маска mat_accent"
+    }
+  },
+  "18": {
+    "class_type": "FluxPro1Fill_fal",
+    "inputs": {
+      "prompt": "deep blue fabric banner, soft folds",
+      "num_images": 1,
+      "safety_tolerance": "5",
+      "output_format": "png",
+      "image": [
+        "15",
+        0
+      ],
+      "mask_image": [
+        "17",
+        0
+      ],
+      "seed": -1,
+      "sync_mode": false,
+      "enhance_prompt": false
+    },
+    "_meta": {
+      "title": "2.4) Inpaint текстом — mat_accent"
+    }
+  },
+  "19": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "18",
+        0
+      ],
+      "filename_prefix": "b2r/04_mat_accent"
+    },
+    "_meta": {
+      "title": "Сейв 04: mat_accent"
+    }
+  },
+  "20": {
+    "class_type": "FluxProKontext_fal",
+    "inputs": {
+      "prompt": "harmonize lighting and reflections across the scene, keep composition, geometry and all objects exactly unchanged",
+      "image": [
+        "18",
+        0
+      ],
+      "guidance_scale": 3.5,
+      "num_images": 1,
+      "safety_tolerance": "5",
+      "output_format": "png",
+      "sync_mode": false
+    },
+    "_meta": {
+      "title": "3) Финал — сшивка света (Kontext)"
+    }
+  },
+  "21": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "20",
+        0
+      ],
+      "filename_prefix": "b2r/99_final"
+    },
+    "_meta": {
+      "title": "Сейв 99: финал"
+    }
+  }
+}

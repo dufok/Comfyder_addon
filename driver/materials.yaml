@@ -1,0 +1,37 @@
+# Конфиг пайплайна: имя материала в Blender = имя маски = ключ здесь.
+# Порядок materials = порядок inpaint-проходов: от крупных поверхностей к мелким.
+
+scene:
+  # общий промпт: стиль, свет, атмосфера — форму держит depth ControlNet
+  prompt: >-
+    modern exhibition booth interior, professional architectural visualization,
+    soft diffused daylight, clean minimalist design, photorealistic render,
+    high detail, neutral color palette
+  width: 1344          # = RES_X/RES_Y в blender/setup_passes.py, max 1536, кратно 16
+  height: 768
+  steps: 28
+  guidance_scale: 3.0
+  controlnet_union: InstantX/FLUX.1-dev-Controlnet-Union
+  control_mode: depth
+  conditioning_scale: 0.65   # 0.6–0.7: выше — жёстче геометрия, ниже — свободнее стиль
+  seed: -1                   # -1 = случайный
+
+materials:
+  - name: mat_wall
+    prompt: smooth white painted drywall, subtle matte finish
+  - name: mat_floor
+    prompt: light oak wood flooring, natural grain, satin finish
+  - name: mat_counter
+    prompt: polished chrome metal panels, mirror-like reflections
+    # reference: swatches/chrome.jpg   # фото-свотч: путь относительно этого файла
+    # target: the counter panels       # куда класть (edit-модель не видит маску)
+    # ref_engine: nanobanana           # nanobanana (default) | kontext
+    # reference_prompt: ...            # полностью свой edit-промпт вместо шаблона
+  - name: mat_accent
+    prompt: deep blue fabric banner, soft folds
+
+final_pass:
+  enabled: false
+  prompt: >-
+    harmonize lighting and reflections across the scene, keep composition,
+    geometry and all objects exactly unchanged
