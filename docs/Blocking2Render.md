@@ -91,6 +91,47 @@ docker run --rm --network host \
 
 `--dump workflow.json` — собрать граф без отправки.
 
+## FAL-ноды: что установлено и как искать
+
+В ComfyUI на proserver стоит пак FAL-нод (суффикс `_fal`, категории `FAL/*`).
+Они не считают локально — это обёртки над fal.ai API (FAL_KEY в окружении
+процесса ComfyUI). Категории: `FAL/Image` (генерация/edit/upscale, ~35 нод),
+`FAL/3D` (Tripo, Hunyuan3D, Trellis — image→glb), `FAL/VideoGeneration`
+(Kling, Veo, Wan, Sora…), `FAL/LLM`, `FAL/VLM`, `FAL/Training` (LoRA-тренеры).
+
+Используемые в пайплайне:
+
+| Нода | Роль | Ключевое |
+|---|---|---|
+| `FluxGeneral_fal` | глобальный проход | единственная с ControlNet Union + IP-Adapter; нет img2img; max 1536px |
+| `FluxPro1Fill_fal` | inpaint текстом | `mask_image` тип IMAGE; `enhance_prompt` (LLM) лучше выключать |
+| `NanoBananaEdit_fal` | материал по референсу | до 4 входных картинок, маску не видит |
+| `FluxProKontextMulti_fal` | то же, вариант 2 | аспект фиксируется явно (`aspect_ratio`) |
+| `FluxProKontext_fal` | финальная сшивка | edit одной картинки промптом, denoise-ручки нет |
+
+**Как инвентаризировать заново** (после обновления пака или на другом сервере) —
+весь каталог нод отдаёт один эндпоинт, UI не нужен:
+
+```bash
+# все ноды с fal/flux в имени + категория
+curl -s http://192.168.1.2:8188/object_info | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for n,i in d.items():
+    if 'fal' in n.lower() or 'flux' in n.lower():
+        print(n,'|',i.get('category'))"
+
+# точная схема входов конкретной ноды (required/optional, типы, дефолты, диапазоны)
+curl -s http://192.168.1.2:8188/object_info | python3 -c "
+import json,sys
+i=json.load(sys.stdin)['FluxGeneral_fal']['input']
+print(json.dumps(i,indent=1,ensure_ascii=False))"
+```
+
+Именно так были найдены все ограничения из раздела «Грабли»: смотри на типы
+входов (IMAGE vs MASK), списки-enum'ы (какие ControlNet'ы доступны) и
+min/max (пределы разрешения). Схема входа = контракт для workflow JSON.
+
 ## Грабли (проверено)
 
 - FAL `flux-general`: один ControlNet Union на вызов, режима seg нет →
