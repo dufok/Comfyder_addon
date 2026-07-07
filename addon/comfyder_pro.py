@@ -1,23 +1,26 @@
-# Comfyder Pro v0.2.0 — зонный AI-рендер пайплайн в N-панели Blender.
+# Comfyder Pro — zone-based AI render pipeline in the Blender N-panel.
 #
-# Полный цикл Blocking2Render одной кнопкой:
-#   1) рендер пака (depth + Cryptomatte-маска на каждую зону, dilate/blur
-#      per-material) временным компоузером — твой компоузер не трогается;
-#   2) граф ComfyUI: глобальный проход (Flux + depth ControlNet) →
-#      зонные проходы по маскам (fill / qwen / gemini / kontext / zturbo) →
-#      финал (Gemini: кадр + depth + промпт настроения + защита фактур);
-#   3) фоновый поллинг, все шаги в папку, финал — в Image Editor.
+# Full Blocking2Render cycle with one button:
+#   1) render the pass pack (depth + a Cryptomatte mask per zone,
+#      per-material dilate/blur) with a temporary compositor — your own
+#      compositor setup is left untouched;
+#   2) ComfyUI graph: global pass (Flux + depth ControlNet) ->
+#      per-zone masked passes (fill / qwen / gemini / kontext / zturbo) ->
+#      final refine (Gemini: frame + depth + mood prompt + protect list);
+#   3) background polling, every step saved to a folder, the final image
+#      loads into the Image Editor.
 #
-# Требования: ComfyUI + паки fal-нод + FAL_KEY (см. README репозитория).
-# Blender 5.0+ (новый API компоузера).
+# Requirements: ComfyUI + fal node packs + FAL_KEY (see the repo README).
+# Blender 5.0+ (new compositor API).
 
 bl_info = {
     "name": "Comfyder Pro",
     "author": "Stepan Vladovskiy",
-    "version": (0, 2, 0),
+    "version": (0, 2, 1),
     "blender": (5, 0, 0),
     "location": "3D View / Image Editor > Sidebar (N) > Comfyder Pro",
-    "description": "Зонный AI-рендер: блокинг → ComfyUI → FAL по маскам материалов",
+    "description": "Zone-based AI rendering: blocking -> ComfyUI -> FAL "
+                   "via material masks",
     "category": "Render",
 }
 
@@ -63,11 +66,11 @@ def _upload(host, path, name=None):
         return json.loads(r.read())["name"]
 
 
-# =================================================================== пак
+# =================================================================== pack
 def _depth_range(scene):
     cam = scene.camera
     if cam is None:
-        raise RuntimeError("В сцене нет камеры")
+        raise RuntimeError("No camera in the scene")
     cp = cam.matrix_world.translation
     vd = (cam.matrix_world.to_quaternion() @ Vector((0, 0, -1))).normalized()
     ds = [(ob.matrix_world @ Vector(c) - cp).dot(vd)
@@ -76,15 +79,15 @@ def _depth_range(scene):
           for c in ob.bound_box]
     ds = [d for d in ds if d > 0]
     if not ds:
-        raise RuntimeError("Перед камерой нет видимой геометрии")
+        raise RuntimeError("No visible geometry in front of the camera")
     near, far = max(min(ds), 0.01), max(ds)
     mg = (far - near) * 0.05
     return max(near - mg, 0.01), far + mg
 
 
 def _file_out(tree, outdir, item_name, color_mode, color_depth):
-    """File Output под Blender 5.x: media IMAGE, формат на item'е,
-    линк строго в inputs[0] (правило №11/№16 из полевых заметок)."""
+    """File Output for Blender 5.x: media IMAGE, per-item format,
+    link strictly into inputs[0] (the last input is a virtual socket)."""
     fo = tree.nodes.new("CompositorNodeOutputFile")
     fo.directory = outdir
     fo.file_name = ""
@@ -100,8 +103,8 @@ def _file_out(tree, outdir, item_name, color_mode, color_depth):
 
 
 def _render_pack(context, zones):
-    """Рендер depth + масок по зонам. zones: [(mat_name, dilate, blur)].
-    Возвращает {'depth': path, 'masks': {mat: path}}."""
+    """Render depth + per-zone masks. zones: [(mat_name, dilate, blur)].
+    Returns {'depth': path, 'masks': {mat: path}}."""
     scene = context.scene
     vl = context.view_layer
     outdir = os.path.join(tempfile.gettempdir(), "comfyder_pack")
@@ -136,7 +139,7 @@ def _render_pack(context, zones):
     gout = tree.nodes.new("NodeGroupOutput")
     tree.links.new(rl.outputs["Image"], gout.inputs[0])
 
-    # depth: near -> 1 (белое), far -> 0
+    # depth: near -> 1 (white), far -> 0 (Flux depth convention)
     mr = tree.nodes.new("ShaderNodeMapRange")
     mr.data_type = 'FLOAT'
     mr.clamp = True
@@ -194,14 +197,14 @@ def _render_pack(context, zones):
     missing = [p for p in [depth] + list(masks.values())
                if not os.path.isfile(p)]
     if missing:
-        raise RuntimeError("Пак не записался: " +
+        raise RuntimeError("Pack not written: " +
                            ", ".join(os.path.basename(p) for p in missing))
     return {"depth": depth, "masks": masks}
 
 
-# =================================================================== граф
+# =================================================================== graph
 def _build_graph(p, zones, depth_name, mask_names, width, height):
-    """zones: список dict'ов с настройками зон (из материалов, по порядку)."""
+    """zones: list of dicts with zone settings (from materials, in order)."""
     graph = {}
     nid = [0]
 
@@ -219,26 +222,26 @@ def _build_graph(p, zones, depth_name, mask_names, width, height):
 
     def composite_back(edited, mask_node, current, zname,
                        src_w=None, src_h=None):
-        """Выход движка -> (скейл/кроп) -> врезка строго по маске."""
-        if src_w:  # известный размер выхода (Gemini 2K): аспект-безопасно
+        """Engine output -> (scale/crop) -> composite strictly by mask."""
+        if src_w:  # known output size (Gemini 2K): aspect-safe center crop
             sw = round(height * src_w / src_h)
-            scaled = node("ImageScale", _title=f"Подгон {zname}",
+            scaled = node("ImageScale", _title=f"Fit {zname}",
                           image=[edited, 0], upscale_method="lanczos",
                           width=sw, height=height, crop="disabled")
-            src = node("ImageCrop", _title=f"Кроп {zname}",
+            src = node("ImageCrop", _title=f"Crop {zname}",
                        image=[scaled, 0], width=width, height=height,
                        x=(sw - width) // 2, y=0)
         else:
-            src = node("ImageScale", _title=f"Подгон {zname}",
+            src = node("ImageScale", _title=f"Fit {zname}",
                        image=[edited, 0], upscale_method="lanczos",
                        width=width, height=height, crop="disabled")
-        return node("ImageCompositeMasked", _title=f"Врезка — {zname}",
+        return node("ImageCompositeMasked", _title=f"Composite — {zname}",
                     destination=[current, 0], source=[src, 0],
                     x=0, y=0, resize_source=False, mask=[mask_node, 0])
 
-    depth_load = node("LoadImage", _title="Вход: depth", image=depth_name)
+    depth_load = node("LoadImage", _title="Input: depth", image=depth_name)
     current = node(
-        "FluxGeneral_fal", _title="1) Глобальный проход (Flux + depth)",
+        "FluxGeneral_fal", _title="1) Global pass (Flux + depth)",
         prompt=p.scene_prompt, image_size="custom",
         width=width, height=height,
         num_inference_steps=28, guidance_scale=3.0, real_cfg_scale=3.3,
@@ -248,12 +251,12 @@ def _build_graph(p, zones, depth_name, mask_names, width, height):
         controlnet_union_control_mode="depth",
         controlnet_conditioning_scale=p.conditioning,
         control_image=[depth_load, 0])
-    save(current, "00_global", "Сейв 00: глобальный")
+    save(current, "00_global", "Save 00: global")
 
     for i, z in enumerate(zones, start=1):
         zname = z["name"]
         seed = z["seed"] or p.seed
-        mask_load = node("LoadImage", _title=f"Маска {zname}",
+        mask_load = node("LoadImage", _title=f"Mask {zname}",
                          image=mask_names[zname])
         m = node("ImageToMask", _title=f"MASK {zname}",
                  image=[mask_load, 0], channel="red")
@@ -303,7 +306,7 @@ def _build_graph(p, zones, depth_name, mask_names, width, height):
                 guidance_scale=3.5, num_images=1, safety_tolerance="5",
                 output_format="png", sync_mode=False)
             current = composite_back(edited, m, current, zname)
-        save(current, f"{i:02d}_{zname}", f"Сейв {i:02d}: {zname}")
+        save(current, f"{i:02d}_{zname}", f"Save {i:02d}: {zname}")
 
     if p.final_enabled:
         protect = [z["target"] or z["prompt"].split(",")[0]
@@ -313,7 +316,7 @@ def _build_graph(p, zones, depth_name, mask_names, width, height):
             fp += " Keep exactly: " + "; ".join(protect) + "."
         fp += " No new objects, no lamps."
         current = node(
-            "FalGeminiFlashEdit", _title="3) Финал — Gemini (кадр + depth)",
+            "FalGeminiFlashEdit", _title="3) Final — Gemini (frame + depth)",
             image=[current, 0], image_2=[depth_load, 0],
             version="3.1-flash-preview", resolution="2K",
             system_prompt=("The first image is the artwork to refine. The "
@@ -322,11 +325,11 @@ def _build_graph(p, zones, depth_name, mask_names, width, height):
                            "never draw it. Preserve the exact composition, "
                            "framing and aspect ratio of the first image."),
             prompt=fp, num_images=1, seed=p.seed)
-        save(current, "99_final", "Сейв 99: финал")
+        save(current, "99_final", "Save 99: final")
     return graph
 
 
-# =================================================================== статус
+# =================================================================== status
 def _set_status(txt):
     sc = bpy.data.scenes.get(_JOB.get("scene") or "") or bpy.data.scenes[0]
     sc.comfyder_pro.status = txt
@@ -345,21 +348,21 @@ def _poll():
     try:
         h = _http_json(f"{host}/history/{pid}", timeout=10)
     except Exception as e:
-        _set_status("Ошибка сети: " + str(e)[:60])
+        _set_status("Network error: " + str(e)[:60])
         _JOB["prompt_id"] = None
         return None
     entry = h.get(pid)
     st = (entry or {}).get("status", {})
     if st.get("status_str") == "error":
-        _set_status("Ошибка выполнения — смотри ComfyUI")
+        _set_status("Execution error — check ComfyUI")
         _JOB["prompt_id"] = None
         return None
     if not entry or not entry.get("outputs"):
         if time.time() - _JOB["t0"] > 1800:
-            _set_status("Таймаут 30 мин — проверь очередь ComfyUI")
+            _set_status("Timeout (30 min) — check the ComfyUI queue")
             _JOB["prompt_id"] = None
             return None
-        _set_status(f"Генерация… {int(time.time() - _JOB['t0'])}с")
+        _set_status(f"Generating… {int(time.time() - _JOB['t0'])}s")
         return 4.0
 
     out_dir = _JOB["out_dir"]
@@ -381,7 +384,7 @@ def _poll():
                 if im["filename"].startswith(_JOB["expected_final"]):
                     final_path = dst
                 if final_path is None:
-                    final_path = dst  # хотя бы последний шаг
+                    final_path = dst  # at least the latest step
         if final_path:
             img = bpy.data.images.load(final_path, check_existing=False)
             img.name = "Comfyder Pro Result"
@@ -391,55 +394,55 @@ def _poll():
                         a.spaces.active.image = img
                         a.tag_redraw()
                         break
-        _set_status("Готово — шаги в " + out_dir)
+        _set_status("Done — steps in " + out_dir)
     except Exception as e:
-        _set_status("Ошибка загрузки результата: " + str(e)[:60])
+        _set_status("Failed to fetch results: " + str(e)[:60])
     _JOB["prompt_id"] = None
     return None
 
 
 # =================================================================== props
 ENGINE_ITEMS = [
-    ("fill", "Fill — перекраска",
-     "FluxPro1Fill: пиксельно точен по маске. Смена цвета, тонкие структуры "
-     "(ветки, провода), бутоны"),
-    ("qwen", "Qwen — фактура",
-     "Сохраняет подложку (ползунок strength) + негативный промпт. "
-     "Дошлифовка фактуры. НЕ для тонкого — ресемплит кадр"),
-    ("gemini_zone", "Gemini — широкая зона",
-     "Умный edit c врезкой по маске, 2K. Стены, вода, фоны"),
-    ("kontext_zone", "Kontext — структура",
-     "Держит форму объекта. Склонен «лакировать» органику"),
-    ("zturbo", "Z-Turbo — черновик", "Быстро и дёшево, для прикидок"),
+    ("fill", "Fill — repaint",
+     "FluxPro1Fill: pixel-exact to the mask. Color changes, thin structures "
+     "(branches, wires), flowers"),
+    ("qwen", "Qwen — texture",
+     "Keeps the underlying image (strength slider) + negative prompt. "
+     "Texture refinement. NOT for thin structures — it resamples the frame"),
+    ("gemini_zone", "Gemini — wide zone",
+     "Smart edit composited back by mask, 2K. Walls, water, backgrounds"),
+    ("kontext_zone", "Kontext — structure",
+     "Holds object shape. Tends to 'lacquer' organic surfaces"),
+    ("zturbo", "Z-Turbo — draft", "Fast and cheap, for quick checks"),
 ]
 
 
 class ComfyderZoneSettings(bpy.types.PropertyGroup):
     prompt: bpy.props.StringProperty(
-        name="Промпт", description="Описание материала зоны (лучше EN)")
-    engine: bpy.props.EnumProperty(name="Движок", items=ENGINE_ITEMS,
+        name="Prompt", description="Zone material description (English works best)")
+    engine: bpy.props.EnumProperty(name="Engine", items=ENGINE_ITEMS,
                                    default="qwen")
     strength: bpy.props.FloatProperty(
         name="Strength", default=0.70, min=0.0, max=1.0,
-        description="Qwen/Z-Turbo: сколько перерисовывать. ~0.7 фактура, "
-                    "0.85+ перекрас (цвет всё равно задаёт глобальный проход)")
+        description="Qwen/Z-Turbo: how much to repaint. ~0.7 texture, "
+                    "0.85+ repaint (color still comes from the global pass)")
     negative: bpy.props.StringProperty(
-        name="Негатив", description="Qwen: чего в зоне быть не должно")
+        name="Negative", description="Qwen: what must NOT appear in the zone")
     target: bpy.props.StringProperty(
-        name="Target", description="Gemini/Kontext: что именно менять "
-                                   "(например: the large torus ring)")
+        name="Target", description="Gemini/Kontext: what exactly to change "
+                                   "(e.g.: the large torus ring)")
     dilate: bpy.props.IntProperty(
         name="Dilate px", default=6, min=0, max=64,
-        description="Расширение маски. Цветам/свечению 15–25")
+        description="Mask expansion. Use 15–25 for flowers/glow")
     blur: bpy.props.IntProperty(
         name="Blur px", default=4, min=0, max=64,
-        description="Мягкость края маски. Цветам 15+")
+        description="Mask edge softness. Use 15+ for flowers")
     protect: bpy.props.BoolProperty(
-        name="Защитить в финале", default=True,
-        description="Добавить «keep …» в финальный промпт")
+        name="Protect in final", default=True,
+        description="Adds 'keep …' for this zone to the final prompt")
     seed: bpy.props.IntProperty(
         name="Seed", default=0, min=0,
-        description="0 = seed сцены. Залочь зону при итерациях")
+        description="0 = scene seed. Lock a zone while iterating")
 
 
 class ComfyderZoneRef(bpy.types.PropertyGroup):
@@ -448,25 +451,26 @@ class ComfyderZoneRef(bpy.types.PropertyGroup):
 
 class ComfyderProProps(bpy.types.PropertyGroup):
     host: bpy.props.StringProperty(name="ComfyUI",
-                                   default="http://192.168.1.2:8188")
+                                   default="http://127.0.0.1:8188")
     scene_prompt: bpy.props.StringProperty(
-        name="Промпт сцены",
-        description="Глобальный проход. Материалы в начале, окружение в конце",
+        name="Scene prompt",
+        description="Global pass. Materials first, environment last — "
+                    "this pass sets the colors of the whole image",
         default="")
     mood: bpy.props.StringProperty(
-        name="Настроение",
+        name="Mood",
         default="cohesive hyperreal 4K render quality, unified soft studio "
                 "lighting, subtle atmospheric haze, shallow depth of field.")
     conditioning: bpy.props.FloatProperty(
-        name="Сила depth", default=0.75, min=0.4, max=0.95,
-        description="ControlNet conditioning: как жёстко держать форму")
+        name="Depth strength", default=0.75, min=0.4, max=0.95,
+        description="ControlNet conditioning: how hard to hold the geometry")
     seed: bpy.props.IntProperty(name="Seed", default=7, min=0)
-    final_enabled: bpy.props.BoolProperty(name="Финальный проход", default=True)
+    final_enabled: bpy.props.BoolProperty(name="Final pass", default=True)
     zones: bpy.props.CollectionProperty(type=ComfyderZoneRef)
     zone_index: bpy.props.IntProperty(default=0)
     status: bpy.props.StringProperty(default="")
     output_dir: bpy.props.StringProperty(
-        name="Результаты", subtype='DIR_PATH', default="//comfyder_out")
+        name="Results", subtype='DIR_PATH', default="//comfyder_out")
 
 
 # =================================================================== zone ops
@@ -478,8 +482,8 @@ def _used_mats():
 
 class COMFYDERPRO_OT_zone_sync(bpy.types.Operator):
     bl_idname = "comfyder_pro.zone_sync"
-    bl_label = "Синхронизировать зоны"
-    bl_description = "Добавить в список все используемые материалы mat_*"
+    bl_label = "Sync zones"
+    bl_description = "Add every used mat_* material of the scene to the list"
 
     def execute(self, context):
         p = context.scene.comfyder_pro
@@ -489,20 +493,19 @@ class COMFYDERPRO_OT_zone_sync(bpy.types.Operator):
             if name not in known:
                 p.zones.add().name = name
                 added += 1
-        # убрать исчезнувшие
         for i in range(len(p.zones) - 1, -1, -1):
             if p.zones[i].name not in bpy.data.materials:
                 p.zones.remove(i)
-        self.report({'INFO'}, f"Добавлено зон: {added}")
+        self.report({'INFO'}, f"Zones added: {added}")
         return {'FINISHED'}
 
 
 class COMFYDERPRO_OT_zone_add(bpy.types.Operator):
     bl_idname = "comfyder_pro.zone_add"
-    bl_label = "Новая зона"
-    bl_description = "Создать материал mat_* и добавить зоной"
+    bl_label = "New zone"
+    bl_description = "Create a mat_* material and add it as a zone"
 
-    name: bpy.props.StringProperty(name="Имя (латиницей)", default="new")
+    name: bpy.props.StringProperty(name="Name (latin)", default="new")
 
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self)
@@ -512,7 +515,7 @@ class COMFYDERPRO_OT_zone_add(bpy.types.Operator):
         slug = "".join(c if c.isalnum() else "_" for c in self.name.lower())
         mat_name = MAT_PREFIX + slug
         if mat_name in bpy.data.materials:
-            self.report({'WARNING'}, f"{mat_name} уже существует")
+            self.report({'WARNING'}, f"{mat_name} already exists")
         else:
             m = bpy.data.materials.new(mat_name)
             m.use_nodes = True
@@ -530,7 +533,7 @@ class COMFYDERPRO_OT_zone_add(bpy.types.Operator):
 
 class COMFYDERPRO_OT_zone_remove(bpy.types.Operator):
     bl_idname = "comfyder_pro.zone_remove"
-    bl_label = "Убрать зону из списка"
+    bl_label = "Remove zone from the list"
 
     def execute(self, context):
         p = context.scene.comfyder_pro
@@ -542,8 +545,8 @@ class COMFYDERPRO_OT_zone_remove(bpy.types.Operator):
 
 class COMFYDERPRO_OT_zone_move(bpy.types.Operator):
     bl_idname = "comfyder_pro.zone_move"
-    bl_label = "Сдвинуть зону"
-    bl_description = "Порядок в списке = порядок проходов (крупное → мелкое)"
+    bl_label = "Move zone"
+    bl_description = "List order = pass order (large -> small)"
 
     direction: bpy.props.EnumProperty(items=[("UP", "Up", ""),
                                              ("DOWN", "Down", "")])
@@ -560,9 +563,9 @@ class COMFYDERPRO_OT_zone_move(bpy.types.Operator):
 
 class COMFYDERPRO_OT_build_prompt(bpy.types.Operator):
     bl_idname = "comfyder_pro.build_prompt"
-    bl_label = "Собрать промпт сцены из зон"
-    bl_description = ("Правило №1: цвета задаёт глобальный проход — "
-                      "материалы в начале промпта")
+    bl_label = "Build scene prompt from zones"
+    bl_description = ("Colors are set by the global pass — zone materials "
+                      "go first in the prompt, add environment at the end")
 
     def execute(self, context):
         p = context.scene.comfyder_pro
@@ -577,7 +580,7 @@ class COMFYDERPRO_OT_build_prompt(bpy.types.Operator):
 
 class COMFYDERPRO_OT_edit_text(bpy.types.Operator):
     bl_idname = "comfyder_pro.edit_text"
-    bl_label = "Редактор"
+    bl_label = "Editor"
 
     which: bpy.props.StringProperty()  # scene | mood | zone
     text: bpy.props.StringProperty(name="")
@@ -613,30 +616,30 @@ class COMFYDERPRO_OT_edit_text(bpy.types.Operator):
 class COMFYDERPRO_OT_generate(bpy.types.Operator):
     bl_idname = "comfyder_pro.generate"
     bl_label = "Generate"
-    bl_description = "Полный прогон: пак → глобальный → зоны → финал"
+    bl_description = "Full run: pass pack -> global -> zones -> final"
 
     def execute(self, context):
         p = context.scene.comfyder_pro
         scene = context.scene
         if _JOB.get("prompt_id"):
-            self.report({'WARNING'}, "Уже идёт генерация")
+            self.report({'WARNING'}, "A generation is already running")
             return {'CANCELLED'}
         if not p.zones:
-            self.report({'ERROR'}, "Нет зон — нажми «Синхронизировать»")
+            self.report({'ERROR'}, "No zones — press Sync zones")
             return {'CANCELLED'}
         if not p.scene_prompt.strip():
-            self.report({'ERROR'}, "Пустой промпт сцены — собери из зон")
+            self.report({'ERROR'}, "Scene prompt is empty — build it from zones")
             return {'CANCELLED'}
 
         zones = []
         for z in p.zones:
             mat = bpy.data.materials.get(z.name)
             if mat is None or mat.users == 0:
-                self.report({'ERROR'}, f"Материал {z.name} не используется")
+                self.report({'ERROR'}, f"Material {z.name} is not used")
                 return {'CANCELLED'}
             s = mat.comfyder
             if not s.prompt.strip():
-                self.report({'ERROR'}, f"У зоны {z.name} пустой промпт")
+                self.report({'ERROR'}, f"Zone {z.name} has an empty prompt")
                 return {'CANCELLED'}
             zones.append({"name": z.name, "prompt": s.prompt.strip(),
                           "engine": s.engine, "strength": s.strength,
@@ -644,20 +647,20 @@ class COMFYDERPRO_OT_generate(bpy.types.Operator):
                           "dilate": s.dilate, "blur": s.blur,
                           "protect": s.protect, "seed": s.seed})
 
-        # разрешение: ≤1536, кратно 16 (лимит FluxGeneral)
+        # resolution: <=1536 px, multiple of 16 (FluxGeneral limits)
         rw, rh = scene.render.resolution_x, scene.render.resolution_y
         w = min(rw, 1536) // 16 * 16
         h = round(w * rh / rw) // 16 * 16
         if (w, h) != (rw, rh):
             scene.render.resolution_x, scene.render.resolution_y = w, h
-            self.report({'INFO'}, f"Разрешение подогнано: {w}x{h}")
+            self.report({'INFO'}, f"Resolution adjusted: {w}x{h}")
 
-        _set_status("Рендер пака…")
+        _set_status("Rendering pass pack…")
         try:
             pack = _render_pack(context, [(z["name"], z["dilate"], z["blur"])
                                           for z in zones])
         except Exception as e:
-            self.report({'ERROR'}, f"Пак: {str(e)[:80]}")
+            self.report({'ERROR'}, f"Pack: {str(e)[:80]}")
             _set_status("")
             return {'CANCELLED'}
 
@@ -682,7 +685,7 @@ class COMFYDERPRO_OT_generate(bpy.types.Operator):
         _JOB.update(prompt_id=resp["prompt_id"], host=host, t0=time.time(),
                     scene=scene.name,
                     out_dir=bpy.path.abspath(p.output_dir))
-        _set_status(f"Отправлено ({len(zones)} зон), жду…")
+        _set_status(f"Submitted ({len(zones)} zones), waiting…")
         if not bpy.app.timers.is_registered(_poll):
             bpy.app.timers.register(_poll, first_interval=4.0)
         return {'FINISHED'}
@@ -701,7 +704,7 @@ class COMFYDERPRO_UL_zones(bpy.types.UIList):
                      "kontext_zone": "Kntx", "zturbo": "ZT"}.get(eng, "?")
             row.label(text=short)
         else:
-            row.label(text=item.name + " (нет)", icon='ERROR')
+            row.label(text=item.name + " (missing)", icon='ERROR')
 
 
 def _wrap_preview(col, text, width=44, lines=5):
@@ -718,7 +721,7 @@ def _draw(panel, context):
     lay = panel.layout
 
     box = lay.box()
-    box.label(text="Сцена", icon='SCENE_DATA')
+    box.label(text="Scene", icon='SCENE_DATA')
     row = box.row(align=True)
     row.prop(p, "scene_prompt", text="")
     op = row.operator("comfyder_pro.edit_text", text="", icon='GREASEPENCIL')
@@ -729,11 +732,11 @@ def _draw(panel, context):
     box.prop(p, "seed")
     cam = context.scene.camera
     if cam and getattr(cam.data, "lens", 0) > 40:
-        box.label(text=f"Объектив {cam.data.lens:.0f}мм: depth будет плоским,"
-                       " лучше 24мм ближе", icon='ERROR')
+        box.label(text=f"Lens {cam.data.lens:.0f}mm: depth will be flat, "
+                       "try 24mm closer", icon='ERROR')
 
     box = lay.box()
-    box.label(text="Зоны (порядок = порядок проходов)", icon='MATERIAL')
+    box.label(text="Zones (list order = pass order)", icon='MATERIAL')
     row = box.row()
     row.template_list("COMFYDERPRO_UL_zones", "", p, "zones", p, "zone_index",
                       rows=4)
@@ -761,7 +764,7 @@ def _draw(panel, context):
             if s.engine in ("qwen", "zturbo"):
                 zb.prop(s, "strength", slider=True)
             if s.engine == "qwen":
-                zb.prop(s, "negative", text="Негатив")
+                zb.prop(s, "negative", text="Negative")
             if s.engine in ("gemini_zone", "kontext_zone"):
                 zb.prop(s, "target", text="Target")
             row = zb.row(align=True)

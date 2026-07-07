@@ -1,21 +1,20 @@
-# Comfyder Lite v0.1 — обработка рендера промптом через ComfyUI + FAL (Gemini).
+# Comfyder Lite — AI-refine your render with a prompt via ComfyUI + FAL.
 #
-# Установка: Edit > Preferences > Add-ons > Install from Disk > этот файл.
-# Использование: рендер (F12) > в окне Render Result нажать N > таб Comfyder >
-# написать промпт настроения > Generate. Результат появится в Image Editor
-# отдельным изображением "Comfyder Result".
+# Install: Edit > Preferences > Add-ons > Install from Disk > this file.
+# Use: render (F12) > in the Render Result window press N > Comfyder tab >
+# type a mood prompt > Generate. The result loads back into the Image
+# Editor as "Comfyder Result".
 #
-# Архитектура (проверена вручную, см. vault: Comfyder Plugin §Lite):
-#   кадр -> [VLM_fal: описание сцены + mood] -> FalGeminiFlashEdit -> результат
-# Поллинг /history через bpy.app.timers — UI не блокируется.
+# Chain: frame -> [VLM_fal: scene description + mood] -> FalGeminiFlashEdit.
+# Polling via bpy.app.timers — the UI never freezes.
 
 bl_info = {
     "name": "Comfyder Lite",
     "author": "Stepan Vladovskiy",
-    "version": (0, 1, 4),
+    "version": (0, 1, 5),
     "blender": (5, 0, 0),
     "location": "Image Editor > Sidebar (N) > Comfyder",
-    "description": "AI-обработка рендера промптом через ComfyUI + FAL",
+    "description": "AI-refine renders with a prompt via ComfyUI + FAL",
     "category": "Render",
 }
 
@@ -30,7 +29,6 @@ import urllib.request
 
 import bpy
 
-# ----------------------------------------------------------------- состояние
 _JOB = {"prompt_id": None, "host": None, "t0": 0.0, "scene": None}
 
 
@@ -59,12 +57,12 @@ def _upload(host, path, name=None):
         return json.loads(r.read())["name"]
 
 
-# ----------------------------------------------------------------- граф
+# ----------------------------------------------------------------- graph
 def _build_graph(image_name, mood, use_vlm, resolution, seed, depth_name=None):
     keep = ("Preserve the exact composition, framing, aspect ratio and all "
             "objects of the first image.")
     g = {"1": {"class_type": "LoadImage", "inputs": {"image": image_name},
-               "_meta": {"title": "Comfyder: вход"}}}
+               "_meta": {"title": "Comfyder: input"}}}
     if depth_name:
         g["9"] = {"class_type": "LoadImage", "inputs": {"image": depth_name},
                   "_meta": {"title": "Comfyder: depth"}}
@@ -101,7 +99,7 @@ def _build_graph(image_name, mood, use_vlm, resolution, seed, depth_name=None):
     g["3"] = {"class_type": "FalGeminiFlashEdit",
               "_meta": {"title": "Comfyder: Gemini"},
               "inputs": inputs}
-    g["4"] = {"class_type": "SaveImage", "_meta": {"title": "Comfyder: сейв"},
+    g["4"] = {"class_type": "SaveImage", "_meta": {"title": "Comfyder: save"},
               "inputs": {"images": ["3", 0],
                          "filename_prefix": "comfyder_lite/result"}}
     return g
@@ -109,19 +107,19 @@ def _build_graph(image_name, mood, use_vlm, resolution, seed, depth_name=None):
 
 # ----------------------------------------------------------------- depth
 def _render_depth(context):
-    """Рендер карты глубины во временный PNG (Blender 5.x компоузер).
+    """Render a fresh depth map to a temp PNG (Blender 5.x compositor).
 
-    Временный node group: Z-pass -> Map Range (near=1, far=0) -> File Output.
-    Исходный компоузер сцены сохраняется и восстанавливается.
-    ВНИМАНИЕ: перерендеривает сцену — Render Result будет заменён
-    (входной кадр к этому моменту уже сохранён во временный файл).
+    Temporary node group: Z-pass -> Map Range (near=1, far=0) -> File Output.
+    The scene's own compositor is saved and restored.
+    NOTE: re-renders the scene — the Render Result preview is replaced
+    (the input frame has already been saved to a temp file by then).
     """
     from mathutils import Vector
     scene = context.scene
     vl = context.view_layer
     cam = scene.camera
     if cam is None:
-        raise RuntimeError("В сцене нет камеры")
+        raise RuntimeError("No camera in the scene")
     cp = cam.matrix_world.translation
     vd = (cam.matrix_world.to_quaternion() @ Vector((0, 0, -1))).normalized()
     ds = [(ob.matrix_world @ Vector(c) - cp).dot(vd)
@@ -130,7 +128,7 @@ def _render_depth(context):
           for c in ob.bound_box]
     ds = [d for d in ds if d > 0]
     if not ds:
-        raise RuntimeError("Перед камерой нет видимой геометрии")
+        raise RuntimeError("No visible geometry in front of the camera")
     near, far = max(min(ds), 0.01), max(ds)
     mg = (far - near) * 0.05
     near, far = max(near - mg, 0.01), far + mg
@@ -185,11 +183,11 @@ def _render_depth(context):
 
     path = os.path.join(outdir, "comfyder_depth.png")
     if not os.path.isfile(path):
-        raise RuntimeError("Depth-файл не записался")
+        raise RuntimeError("Depth file was not written")
     return path
 
 
-# ----------------------------------------------------------------- статус
+# ----------------------------------------------------------------- status
 def _set_status(txt):
     sc = bpy.data.scenes.get(_JOB.get("scene") or "") or bpy.data.scenes[0]
     sc.comfyder.status = txt
@@ -201,7 +199,7 @@ def _set_status(txt):
                     a.tag_redraw()
 
 
-# ----------------------------------------------------------------- поллинг
+# ----------------------------------------------------------------- polling
 def _poll():
     pid, host = _JOB.get("prompt_id"), _JOB.get("host")
     if not pid:
@@ -209,7 +207,7 @@ def _poll():
     try:
         h = _http_json(f"{host}/history/{pid}", timeout=10)
     except Exception as e:
-        _set_status("Ошибка сети: " + str(e)[:60])
+        _set_status("Network error: " + str(e)[:60])
         _JOB["prompt_id"] = None
         return None
 
@@ -217,17 +215,16 @@ def _poll():
     if not entry or not entry.get("outputs"):
         st = (entry or {}).get("status", {})
         if st.get("status_str") == "error":
-            _set_status("Ошибка выполнения — смотри ComfyUI")
+            _set_status("Execution error — check ComfyUI")
             _JOB["prompt_id"] = None
             return None
         if time.time() - _JOB["t0"] > 420:
-            _set_status("Таймаут 7 мин — проверь очередь ComfyUI")
+            _set_status("Timeout (7 min) — check the ComfyUI queue")
             _JOB["prompt_id"] = None
             return None
-        _set_status(f"Генерация… {int(time.time() - _JOB['t0'])}с")
+        _set_status(f"Generating… {int(time.time() - _JOB['t0'])}s")
         return 3.0
 
-    # готово — качаем первую картинку
     try:
         for o in entry["outputs"].values():
             for im in o.get("images", []):
@@ -250,48 +247,49 @@ def _poll():
                             a.spaces.active.image = img
                             a.tag_redraw()
                             shown = True
-                _set_status("Готово: " + img.name)
+                _set_status("Done: " + img.name)
                 _JOB["prompt_id"] = None
                 return None
     except Exception as e:
-        _set_status("Ошибка загрузки результата: " + str(e)[:60])
+        _set_status("Failed to fetch the result: " + str(e)[:60])
         _JOB["prompt_id"] = None
         return None
     return 3.0
 
 
-# ----------------------------------------------------------------- свойства
+# ----------------------------------------------------------------- props
 class ComfyderProps(bpy.types.PropertyGroup):
     host: bpy.props.StringProperty(
-        name="ComfyUI", default="http://192.168.1.2:8188")
+        name="ComfyUI", default="http://127.0.0.1:8188")
     mood: bpy.props.StringProperty(
-        name="Промпт", description="Настроение/стиль — можно по-русски",
+        name="Prompt", description="Mood/style — any language works",
         default="4K high resolution render quality, cinematic soft lighting, "
                 "subtle atmospheric haze")
     use_vlm: bpy.props.BoolProperty(
-        name="VLM-описание сцены",
-        description="Vision-модель опишет кадр и склеит описание с промптом",
+        name="VLM scene description",
+        description="A vision model describes the frame first, then your "
+                    "mood prompt is applied on top — better scene fidelity",
         default=True)
     resolution: bpy.props.EnumProperty(
-        name="Разрешение",
+        name="Resolution",
         items=[("1K", "1K", ""), ("2K", "2K", ""), ("4K", "4K", "")],
         default="2K")
     seed: bpy.props.IntProperty(name="Seed", default=7, min=0)
     source: bpy.props.EnumProperty(
-        name="Источник",
-        items=[("RENDER", "Рендер", "Последний Render Result (F12)"),
-               ("VIEWPORT", "Вьюпорт", "OpenGL-снимок активного вьюпорта — "
-                                       "быстрый черновик без рендера")],
+        name="Source",
+        items=[("RENDER", "Render", "Last Render Result (F12)"),
+               ("VIEWPORT", "Viewport", "OpenGL snapshot of the active "
+                                        "viewport — quick draft, no render")],
         default="RENDER")
     use_depth: bpy.props.BoolProperty(
-        name="Прикладывать depth",
-        description="Отдать Gemini карту глубины вторым входом — "
-                    "жёстче держит геометрию",
+        name="Attach depth",
+        description="Send a depth map as a second input — locks geometry "
+                    "much harder",
         default=False)
     auto_depth: bpy.props.BoolProperty(
-        name="Авто-рендер depth",
-        description="Сгенерировать свежую карту глубины самому "
-                    "(Z-pass, быстрый перерендер; Render Result будет заменён)",
+        name="Auto-render depth",
+        description="Render a fresh Z-pass depth map automatically "
+                    "(quick re-render; replaces the Render Result preview)",
         default=True)
     depth_path: bpy.props.StringProperty(
         name="Depth PNG", subtype='FILE_PATH',
@@ -301,8 +299,8 @@ class ComfyderProps(bpy.types.PropertyGroup):
 
 class COMFYDER_OT_edit_prompt(bpy.types.Operator):
     bl_idname = "comfyder.edit_prompt"
-    bl_label = "Промпт настроения"
-    bl_description = "Редактировать промпт в широком окне"
+    bl_label = "Mood prompt"
+    bl_description = "Edit the prompt in a wide dialog"
 
     mood: bpy.props.StringProperty(name="", default="")
 
@@ -318,16 +316,16 @@ class COMFYDER_OT_edit_prompt(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# ----------------------------------------------------------------- оператор
+# ----------------------------------------------------------------- operator
 class COMFYDER_OT_generate(bpy.types.Operator):
     bl_idname = "comfyder.generate"
     bl_label = "Generate"
-    bl_description = "Отправить кадр в ComfyUI/FAL и получить AI-обработку"
+    bl_description = "Send the frame to ComfyUI/FAL and get an AI refine back"
 
     def execute(self, context):
         p = context.scene.comfyder
         if _JOB.get("prompt_id"):
-            self.report({'WARNING'}, "Уже идёт генерация")
+            self.report({'WARNING'}, "A generation is already running")
             return {'CANCELLED'}
 
         img = None
@@ -337,7 +335,7 @@ class COMFYDER_OT_generate(bpy.types.Operator):
                 bpy.ops.render.opengl(view_context=in3d)
                 img = bpy.data.images.get("Render Result")
             except Exception as e:
-                self.report({'ERROR'}, f"Вьюпорт-снимок не удался: {str(e)[:60]}")
+                self.report({'ERROR'}, f"Viewport snapshot failed: {str(e)[:60]}")
                 return {'CANCELLED'}
         else:
             sp = getattr(context, "space_data", None)
@@ -346,14 +344,14 @@ class COMFYDER_OT_generate(bpy.types.Operator):
             if img is None:
                 img = bpy.data.images.get("Render Result")
         if img is None:
-            self.report({'ERROR'}, "Нет изображения — сначала сделай рендер")
+            self.report({'ERROR'}, "No image — render first")
             return {'CANCELLED'}
 
         tmp = os.path.join(tempfile.gettempdir(), "comfyder_in.png")
         try:
             img.save_render(tmp, scene=context.scene)
         except Exception as e:
-            self.report({'ERROR'}, f"Не смог сохранить кадр: {e}")
+            self.report({'ERROR'}, f"Could not save the frame: {e}")
             return {'CANCELLED'}
 
         host = p.host.rstrip("/")
@@ -363,13 +361,13 @@ class COMFYDER_OT_generate(bpy.types.Operator):
             if p.auto_depth:
                 if p.source == 'VIEWPORT':
                     self.report({'WARNING'},
-                                "Авто-depth только с источником «Рендер» — еду без")
+                                "Auto-depth needs the Render source — skipping")
                 else:
                     try:
                         dp = _render_depth(context)
                     except Exception as e:
                         self.report({'WARNING'},
-                                    f"Авто-depth не удался: {str(e)[:60]}")
+                                    f"Auto-depth failed: {str(e)[:60]}")
             else:
                 cand = bpy.path.abspath(p.depth_path)
                 dp = cand if os.path.isfile(cand) else None
@@ -379,7 +377,7 @@ class COMFYDER_OT_generate(bpy.types.Operator):
                 except Exception:
                     depth_name = None
             if depth_name is None:
-                self.report({'WARNING'}, "Depth не приложен — еду без него")
+                self.report({'WARNING'}, "Depth not attached — going without")
         try:
             name = _upload(host, tmp, "comfyder_in.png")
             graph = _build_graph(name, p.mood.strip(), p.use_vlm,
@@ -388,29 +386,28 @@ class COMFYDER_OT_generate(bpy.types.Operator):
                               {"prompt": graph,
                                "client_id": str(uuid.uuid4())}, timeout=60)
         except Exception as e:
-            self.report({'ERROR'}, f"ComfyUI недоступен: {str(e)[:80]}")
+            self.report({'ERROR'}, f"ComfyUI unreachable: {str(e)[:80]}")
             return {'CANCELLED'}
 
         if resp.get("node_errors"):
-            self.report({'ERROR'}, "Ошибки нод: " + str(resp["node_errors"])[:100])
+            self.report({'ERROR'}, "Node errors: " + str(resp["node_errors"])[:100])
             return {'CANCELLED'}
 
         _JOB.update(prompt_id=resp["prompt_id"], host=host,
                     t0=time.time(), scene=context.scene.name)
-        _set_status("Отправлено, жду…")
+        _set_status("Submitted, waiting…")
         if not bpy.app.timers.is_registered(_poll):
             bpy.app.timers.register(_poll, first_interval=3.0)
         return {'FINISHED'}
 
 
-# ----------------------------------------------------------------- панели
+# ----------------------------------------------------------------- panels
 def _draw(panel, context):
     p = context.scene.comfyder
     col = panel.layout.column(align=False)
     row = col.row(align=True)
     row.prop(p, "mood", text="")
     row.operator("comfyder.edit_prompt", text="", icon='GREASEPENCIL')
-    # перенос длинного промпта в читаемые строки
     if len(p.mood) > 38:
         box = col.box()
         bc = box.column(align=True)
@@ -456,7 +453,7 @@ class COMFYDER_PT_view3d(bpy.types.Panel):
         _draw(self, context)
 
 
-# ----------------------------------------------------------------- регистрация
+# ----------------------------------------------------------------- register
 classes = (ComfyderProps, COMFYDER_OT_edit_prompt, COMFYDER_OT_generate,
            COMFYDER_PT_image, COMFYDER_PT_view3d)
 
