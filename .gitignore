@@ -1,4 +1,9 @@
 render_pack/
 out/
+out_v*/
 __pycache__/
+*.pyc
+*.blend
 *.blend1
+.DS_Store
+workflow?.json
