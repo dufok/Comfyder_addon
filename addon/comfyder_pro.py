@@ -1,14 +1,14 @@
 # Comfyder Pro — zone-based AI render pipeline in the Blender N-panel.
 #
-# Full Blocking2Render cycle with one button:
-#   1) render the pass pack (depth + a Cryptomatte mask per zone,
-#      per-material dilate/blur) with a temporary compositor — your own
-#      compositor setup is left untouched;
+# Full Blocking2Render cycle with one button, plus result history with Pin:
+#   1) render the pass pack (depth + a Cryptomatte mask per zone) with a
+#      temporary compositor — your own compositor setup is left untouched;
 #   2) ComfyUI graph: global pass (Flux + depth ControlNet) ->
-#      per-zone masked passes (fill / qwen / gemini / kontext / zturbo) ->
-#      final refine (Gemini: frame + depth + mood prompt + protect list);
-#   3) background polling, every step saved to a folder, the final image
-#      loads into the Image Editor.
+#      per-zone masked passes -> final refine (Gemini: frame + depth);
+#   3) every run lands in its own run_* folder with a settings snapshot;
+#      Pin any step and iterate from it for cents: re-run a single zone
+#      or just the final mood pass. FAL is not deterministic — pinning is
+#      how you keep a result you like.
 #
 # Requirements: ComfyUI + fal node packs + FAL_KEY (see the repo README).
 # Blender 5.0+ (new compositor API).
@@ -16,11 +16,10 @@
 bl_info = {
     "name": "Comfyder Pro",
     "author": "Stepan Vladovskiy",
-    "version": (0, 2, 1),
+    "version": (0, 3, 0),
     "blender": (5, 0, 0),
     "location": "3D View / Image Editor > Sidebar (N) > Comfyder Pro",
-    "description": "Zone-based AI rendering: blocking -> ComfyUI -> FAL "
-                   "via material masks",
+    "description": "Zone-based AI rendering with result history and Pin",
     "category": "Render",
 }
 
@@ -37,8 +36,9 @@ import bpy
 from mathutils import Vector
 
 MAT_PREFIX = "mat_"
+HIST_CAP = 200
 _JOB = {"prompt_id": None, "host": None, "t0": 0.0, "scene": None,
-        "out_dir": None, "expected_final": "99_final"}
+        "run_dir": None, "final_prefix": "99_final"}
 
 
 # =================================================================== HTTP
@@ -103,8 +103,8 @@ def _file_out(tree, outdir, item_name, color_mode, color_depth):
 
 
 def _render_pack(context, zones):
-    """Render depth + per-zone masks. zones: [(mat_name, dilate, blur)].
-    Returns {'depth': path, 'masks': {mat: path}}."""
+    """Render depth + per-zone masks. zones: [(mat_name, dilate, blur)]
+    (may be empty -> depth only). Returns {'depth': path, 'masks': {...}}."""
     scene = context.scene
     vl = context.view_layer
     outdir = os.path.join(tempfile.gettempdir(), "comfyder_pack")
@@ -203,44 +203,129 @@ def _render_pack(context, zones):
 
 
 # =================================================================== graph
-def _build_graph(p, zones, depth_name, mask_names, width, height):
-    """zones: list of dicts with zone settings (from materials, in order)."""
-    graph = {}
-    nid = [0]
+class _G:
+    """Tiny ComfyUI API-graph builder."""
 
-    def node(class_type, _title=None, **inputs):
-        nid[0] += 1
-        k = str(nid[0])
-        graph[k] = {"class_type": class_type, "inputs": inputs}
+    def __init__(self, prefix="comfyder_pro"):
+        self.graph = {}
+        self._i = 0
+        self.prefix = prefix
+
+    def node(self, class_type, _title=None, **inputs):
+        self._i += 1
+        k = str(self._i)
+        self.graph[k] = {"class_type": class_type, "inputs": inputs}
         if _title:
-            graph[k]["_meta"] = {"title": _title}
+            self.graph[k]["_meta"] = {"title": _title}
         return k
 
-    def save(img, name, title):
-        node("SaveImage", _title=title, images=[img, 0],
-             filename_prefix=f"comfyder_pro/{name}")
+    def save(self, img, name, title):
+        self.node("SaveImage", _title=title, images=[img, 0],
+                  filename_prefix=f"{self.prefix}/{name}")
 
-    def composite_back(edited, mask_node, current, zname,
-                       src_w=None, src_h=None):
-        """Engine output -> (scale/crop) -> composite strictly by mask."""
-        if src_w:  # known output size (Gemini 2K): aspect-safe center crop
-            sw = round(height * src_w / src_h)
-            scaled = node("ImageScale", _title=f"Fit {zname}",
-                          image=[edited, 0], upscale_method="lanczos",
-                          width=sw, height=height, crop="disabled")
-            src = node("ImageCrop", _title=f"Crop {zname}",
-                       image=[scaled, 0], width=width, height=height,
-                       x=(sw - width) // 2, y=0)
-        else:
-            src = node("ImageScale", _title=f"Fit {zname}",
-                       image=[edited, 0], upscale_method="lanczos",
-                       width=width, height=height, crop="disabled")
-        return node("ImageCompositeMasked", _title=f"Composite — {zname}",
-                    destination=[current, 0], source=[src, 0],
-                    x=0, y=0, resize_source=False, mask=[mask_node, 0])
 
-    depth_load = node("LoadImage", _title="Input: depth", image=depth_name)
-    current = node(
+def _composite_back(g, edited, mask_node, current, zname, width, height,
+                    src_w=None, src_h=None):
+    """Engine output -> (scale/crop) -> composite strictly by mask."""
+    if src_w:  # known output size (Gemini 2K): aspect-safe center crop
+        sw = round(height * src_w / src_h)
+        scaled = g.node("ImageScale", _title=f"Fit {zname}",
+                        image=[edited, 0], upscale_method="lanczos",
+                        width=sw, height=height, crop="disabled")
+        src = g.node("ImageCrop", _title=f"Crop {zname}",
+                     image=[scaled, 0], width=width, height=height,
+                     x=(sw - width) // 2, y=0)
+    else:
+        src = g.node("ImageScale", _title=f"Fit {zname}",
+                     image=[edited, 0], upscale_method="lanczos",
+                     width=width, height=height, crop="disabled")
+    return g.node("ImageCompositeMasked", _title=f"Composite — {zname}",
+                  destination=[current, 0], source=[src, 0],
+                  x=0, y=0, resize_source=False, mask=[mask_node, 0])
+
+
+def _zone_pass(g, z, current, mask_name, width, height, seed_default, idx=1):
+    """One zone pass (any engine). Returns the new current node id."""
+    zname = z["name"]
+    seed = z["seed"] or seed_default
+    mask_load = g.node("LoadImage", _title=f"Mask {zname}", image=mask_name)
+    m = g.node("ImageToMask", _title=f"MASK {zname}",
+               image=[mask_load, 0], channel="red")
+    eng = z["engine"]
+    if eng == "fill":
+        return g.node(
+            "FluxPro1Fill_fal", _title=f"2.{idx}) Fill — {zname}",
+            prompt=z["prompt"], num_images=1, safety_tolerance="5",
+            output_format="png", image=[current, 0],
+            mask_image=[mask_load, 0], seed=seed,
+            sync_mode=False, enhance_prompt=False)
+    if eng == "qwen":
+        edited = g.node(
+            "FalQwenImageEditInpaint", _title=f"2.{idx}) Qwen — {zname}",
+            image=[current, 0], mask=[m, 0], prompt=z["prompt"],
+            strength=z["strength"], guidance_scale=4.0,
+            num_inference_steps=30, negative_prompt=z["negative"],
+            num_images=1, seed=seed)
+        return _composite_back(g, edited, m, current, zname, width, height)
+    if eng == "zturbo":
+        edited = g.node(
+            "FalZImageTurboInpaint", _title=f"2.{idx}) Z-Turbo — {zname}",
+            image=[current, 0], mask=[m, 0], prompt=z["prompt"],
+            strength=z["strength"], num_inference_steps=8,
+            acceleration="regular", num_images=1, seed=seed)
+        return _composite_back(g, edited, m, current, zname, width, height)
+    if eng == "gemini_zone":
+        tgt = z["target"] or f"the {zname[len(MAT_PREFIX):]} zone"
+        edited = g.node(
+            "FalGeminiFlashEdit", _title=f"2.{idx}) Gemini — {zname}",
+            image=[current, 0], prompt=z["prompt"],
+            version="3.1-flash-preview", resolution="2K",
+            system_prompt=("You are editing exactly one zone of the image. "
+                           f"Change ONLY {tgt}. Keep composition, all other "
+                           "objects, lighting, framing and aspect ratio "
+                           "exactly unchanged."),
+            num_images=1, seed=seed)
+        return _composite_back(g, edited, m, current, zname, width, height,
+                               src_w=2752, src_h=1536)
+    if eng == "kontext_zone":
+        tgt = z["target"] or "the masked area"
+        instr = (f"Change {tgt} to: {z['prompt']}. Keep the composition, "
+                 "camera, lighting and everything else exactly unchanged.")
+        edited = g.node(
+            "FluxProKontext_fal", _title=f"2.{idx}) Kontext — {zname}",
+            prompt=instr, image=[current, 0], aspect_ratio="16:9",
+            guidance_scale=3.5, num_images=1, safety_tolerance="5",
+            output_format="png", sync_mode=False)
+        return _composite_back(g, edited, m, current, zname, width, height)
+    raise RuntimeError(f"Unknown engine: {eng}")
+
+
+def _final_prompt(mood, zones):
+    protect = [z["target"] or z["prompt"].split(",")[0]
+               for z in zones if z.get("protect")]
+    fp = mood.strip()
+    if protect:
+        fp += " Keep exactly: " + "; ".join(protect) + "."
+    return fp + " No new objects, no lamps."
+
+
+def _final_pass(g, mood_full, current, depth_ref, seed):
+    return g.node(
+        "FalGeminiFlashEdit", _title="3) Final — Gemini (frame + depth)",
+        image=[current, 0], image_2=[depth_ref, 0],
+        version="3.1-flash-preview", resolution="2K",
+        system_prompt=("The first image is the artwork to refine. The second "
+                       "image is its depth map (white = near camera) — use "
+                       "it ONLY as geometry reference, never draw it. "
+                       "Preserve the exact composition, framing and aspect "
+                       "ratio of the first image."),
+        prompt=mood_full, num_images=1, seed=seed)
+
+
+def _build_graph(p, zones, depth_name, mask_names, width, height):
+    g = _G()
+    depth_load = g.node("LoadImage", _title="Input: depth", image=depth_name)
+    current = g.node(
         "FluxGeneral_fal", _title="1) Global pass (Flux + depth)",
         prompt=p.scene_prompt, image_size="custom",
         width=width, height=height,
@@ -251,82 +336,71 @@ def _build_graph(p, zones, depth_name, mask_names, width, height):
         controlnet_union_control_mode="depth",
         controlnet_conditioning_scale=p.conditioning,
         control_image=[depth_load, 0])
-    save(current, "00_global", "Save 00: global")
-
+    g.save(current, "00_global", "Save 00: global")
     for i, z in enumerate(zones, start=1):
-        zname = z["name"]
-        seed = z["seed"] or p.seed
-        mask_load = node("LoadImage", _title=f"Mask {zname}",
-                         image=mask_names[zname])
-        m = node("ImageToMask", _title=f"MASK {zname}",
-                 image=[mask_load, 0], channel="red")
-        eng = z["engine"]
-        if eng == "fill":
-            current = node(
-                "FluxPro1Fill_fal", _title=f"2.{i}) Fill — {zname}",
-                prompt=z["prompt"], num_images=1, safety_tolerance="5",
-                output_format="png", image=[current, 0],
-                mask_image=[mask_load, 0], seed=seed,
-                sync_mode=False, enhance_prompt=False)
-        elif eng == "qwen":
-            edited = node(
-                "FalQwenImageEditInpaint", _title=f"2.{i}) Qwen — {zname}",
-                image=[current, 0], mask=[m, 0], prompt=z["prompt"],
-                strength=z["strength"], guidance_scale=4.0,
-                num_inference_steps=30, negative_prompt=z["negative"],
-                num_images=1, seed=seed)
-            current = composite_back(edited, m, current, zname)
-        elif eng == "zturbo":
-            edited = node(
-                "FalZImageTurboInpaint", _title=f"2.{i}) Z-Turbo — {zname}",
-                image=[current, 0], mask=[m, 0], prompt=z["prompt"],
-                strength=z["strength"], num_inference_steps=8,
-                acceleration="regular", num_images=1, seed=seed)
-            current = composite_back(edited, m, current, zname)
-        elif eng == "gemini_zone":
-            tgt = z["target"] or f"the {zname[len(MAT_PREFIX):]} zone"
-            edited = node(
-                "FalGeminiFlashEdit", _title=f"2.{i}) Gemini — {zname}",
-                image=[current, 0], prompt=z["prompt"],
-                version="3.1-flash-preview", resolution="2K",
-                system_prompt=("You are editing exactly one zone of the "
-                               f"image. Change ONLY {tgt}. Keep composition, "
-                               "all other objects, lighting, framing and "
-                               "aspect ratio exactly unchanged."),
-                num_images=1, seed=seed)
-            current = composite_back(edited, m, current, zname,
-                                     src_w=2752, src_h=1536)
-        elif eng == "kontext_zone":
-            tgt = z["target"] or "the masked area"
-            instr = (f"Change {tgt} to: {z['prompt']}. Keep the composition, "
-                     "camera, lighting and everything else exactly unchanged.")
-            edited = node(
-                "FluxProKontext_fal", _title=f"2.{i}) Kontext — {zname}",
-                prompt=instr, image=[current, 0], aspect_ratio="16:9",
-                guidance_scale=3.5, num_images=1, safety_tolerance="5",
-                output_format="png", sync_mode=False)
-            current = composite_back(edited, m, current, zname)
-        save(current, f"{i:02d}_{zname}", f"Save {i:02d}: {zname}")
-
+        current = _zone_pass(g, z, current, mask_names[z["name"]],
+                             width, height, p.seed, idx=i)
+        g.save(current, f"{i:02d}_{z['name']}", f"Save {i:02d}: {z['name']}")
     if p.final_enabled:
-        protect = [z["target"] or z["prompt"].split(",")[0]
-                   for z in zones if z["protect"]]
-        fp = p.mood.strip()
-        if protect:
-            fp += " Keep exactly: " + "; ".join(protect) + "."
-        fp += " No new objects, no lamps."
-        current = node(
-            "FalGeminiFlashEdit", _title="3) Final — Gemini (frame + depth)",
-            image=[current, 0], image_2=[depth_load, 0],
-            version="3.1-flash-preview", resolution="2K",
-            system_prompt=("The first image is the artwork to refine. The "
-                           "second image is its depth map (white = near "
-                           "camera) — use it ONLY as geometry reference, "
-                           "never draw it. Preserve the exact composition, "
-                           "framing and aspect ratio of the first image."),
-            prompt=fp, num_images=1, seed=p.seed)
-        save(current, "99_final", "Save 99: final")
-    return graph
+        current = _final_pass(g, _final_prompt(p.mood, zones), current,
+                              depth_load, p.seed)
+        g.save(current, "99_final", "Save 99: final")
+    return g.graph
+
+
+def _build_pin_zone_graph(p, z, pin_name, mask_name, depth_name,
+                          width, height):
+    g = _G()
+    current = g.node("LoadImage", _title="Pin: frame", image=pin_name)
+    current = _zone_pass(g, z, current, mask_name, width, height, p.seed)
+    g.save(current, f"10_{z['name']}_pin", f"Save: {z['name']} (from pin)")
+    if p.final_enabled and depth_name:
+        depth_load = g.node("LoadImage", _title="Input: depth",
+                            image=depth_name)
+        current = _final_pass(g, _final_prompt(p.mood, [z]), current,
+                              depth_load, p.seed)
+        g.save(current, "99_final", "Save 99: final")
+    return g.graph
+
+
+def _build_pin_final_graph(p, zones, pin_name, depth_name, width, height):
+    g = _G()
+    current = g.node("LoadImage", _title="Pin: frame", image=pin_name)
+    depth_load = g.node("LoadImage", _title="Input: depth", image=depth_name)
+    current = _final_pass(g, _final_prompt(p.mood, zones), current,
+                          depth_load, p.seed)
+    g.save(current, "99_final", "Save 99: final (from pin)")
+    return g.graph
+
+
+# =================================================================== history
+def _hist_add(scene, label, path):
+    p = scene.comfyder_pro
+    it = p.hist.add()
+    it.label = label
+    it.path = path
+    while len(p.hist) > HIST_CAP:
+        p.hist.remove(0)
+    p.hist_index = len(p.hist) - 1
+
+
+def _run_meta(p, zones, kind):
+    return {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": kind,
+            "scene_prompt": p.scene_prompt, "mood": p.mood,
+            "conditioning": p.conditioning, "seed": p.seed,
+            "final": p.final_enabled, "zones": zones}
+
+
+def _start_run(context, kind, zones_meta):
+    """Create the run folder + settings snapshot; return its path."""
+    p = context.scene.comfyder_pro
+    base = bpy.path.abspath(p.output_dir)
+    run_dir = os.path.join(base, time.strftime("run_%Y%m%d_%H%M%S"))
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "run.json"), "w", encoding="utf-8") as fh:
+        json.dump(_run_meta(p, zones_meta, kind), fh,
+                  ensure_ascii=False, indent=1)
+    return run_dir
 
 
 # =================================================================== status
@@ -365,8 +439,10 @@ def _poll():
         _set_status(f"Generating… {int(time.time() - _JOB['t0'])}s")
         return 4.0
 
-    out_dir = _JOB["out_dir"]
-    os.makedirs(out_dir, exist_ok=True)
+    run_dir = _JOB["run_dir"]
+    os.makedirs(run_dir, exist_ok=True)
+    scene = bpy.data.scenes.get(_JOB.get("scene") or "") or bpy.data.scenes[0]
+    run_tag = os.path.basename(run_dir).replace("run_", "")
     final_path = None
     try:
         for node_id, o in sorted(entry["outputs"].items(),
@@ -378,10 +454,12 @@ def _poll():
                     "type": im.get("type", "output")})
                 data = urllib.request.urlopen(
                     f"{host}/view?{qs}", timeout=120).read()
-                dst = os.path.join(out_dir, im["filename"])
+                dst = os.path.join(run_dir, im["filename"])
                 with open(dst, "wb") as fh:
                     fh.write(data)
-                if im["filename"].startswith(_JOB["expected_final"]):
+                step = im["filename"].split("_0000")[0]
+                _hist_add(scene, f"{run_tag} · {step}", dst)
+                if im["filename"].startswith(_JOB["final_prefix"]):
                     final_path = dst
                 if final_path is None:
                     final_path = dst  # at least the latest step
@@ -394,11 +472,25 @@ def _poll():
                         a.spaces.active.image = img
                         a.tag_redraw()
                         break
-        _set_status("Done — steps in " + out_dir)
+        _set_status("Done — " + os.path.basename(run_dir))
     except Exception as e:
         _set_status("Failed to fetch results: " + str(e)[:60])
     _JOB["prompt_id"] = None
     return None
+
+
+def _submit(context, graph, run_dir):
+    p = context.scene.comfyder_pro
+    host = p.host.rstrip("/")
+    resp = _http_json(host + "/prompt",
+                      {"prompt": graph, "client_id": str(uuid.uuid4())},
+                      timeout=60)
+    if resp.get("node_errors"):
+        raise RuntimeError(str(resp["node_errors"])[:120])
+    _JOB.update(prompt_id=resp["prompt_id"], host=host, t0=time.time(),
+                scene=context.scene.name, run_dir=run_dir)
+    if not bpy.app.timers.is_registered(_poll):
+        bpy.app.timers.register(_poll, first_interval=4.0)
 
 
 # =================================================================== props
@@ -449,6 +541,11 @@ class ComfyderZoneRef(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty()
 
 
+class ComfyderHistItem(bpy.types.PropertyGroup):
+    label: bpy.props.StringProperty()
+    path: bpy.props.StringProperty()
+
+
 class ComfyderProProps(bpy.types.PropertyGroup):
     host: bpy.props.StringProperty(name="ComfyUI",
                                    default="http://127.0.0.1:8188")
@@ -468,6 +565,10 @@ class ComfyderProProps(bpy.types.PropertyGroup):
     final_enabled: bpy.props.BoolProperty(name="Final pass", default=True)
     zones: bpy.props.CollectionProperty(type=ComfyderZoneRef)
     zone_index: bpy.props.IntProperty(default=0)
+    hist: bpy.props.CollectionProperty(type=ComfyderHistItem)
+    hist_index: bpy.props.IntProperty(default=0)
+    pin_path: bpy.props.StringProperty(default="")
+    pin_label: bpy.props.StringProperty(default="")
     status: bpy.props.StringProperty(default="")
     output_dir: bpy.props.StringProperty(
         name="Results", subtype='DIR_PATH', default="//comfyder_out")
@@ -478,6 +579,24 @@ def _used_mats():
     return [m.name for m in bpy.data.materials
             if m.users > 0 and not m.is_grease_pencil
             and m.name.startswith(MAT_PREFIX)]
+
+
+def _zone_dict(mat):
+    s = mat.comfyder
+    return {"name": mat.name, "prompt": s.prompt.strip(),
+            "engine": s.engine, "strength": s.strength,
+            "negative": s.negative, "target": s.target,
+            "dilate": s.dilate, "blur": s.blur,
+            "protect": s.protect, "seed": s.seed}
+
+
+def _fit_resolution(scene):
+    rw, rh = scene.render.resolution_x, scene.render.resolution_y
+    w = min(rw, 1536) // 16 * 16
+    h = round(w * rh / rw) // 16 * 16
+    if (w, h) != (rw, rh):
+        scene.render.resolution_x, scene.render.resolution_y = w, h
+    return w, h
 
 
 class COMFYDERPRO_OT_zone_sync(bpy.types.Operator):
@@ -637,24 +756,12 @@ class COMFYDERPRO_OT_generate(bpy.types.Operator):
             if mat is None or mat.users == 0:
                 self.report({'ERROR'}, f"Material {z.name} is not used")
                 return {'CANCELLED'}
-            s = mat.comfyder
-            if not s.prompt.strip():
+            if not mat.comfyder.prompt.strip():
                 self.report({'ERROR'}, f"Zone {z.name} has an empty prompt")
                 return {'CANCELLED'}
-            zones.append({"name": z.name, "prompt": s.prompt.strip(),
-                          "engine": s.engine, "strength": s.strength,
-                          "negative": s.negative, "target": s.target,
-                          "dilate": s.dilate, "blur": s.blur,
-                          "protect": s.protect, "seed": s.seed})
+            zones.append(_zone_dict(mat))
 
-        # resolution: <=1536 px, multiple of 16 (FluxGeneral limits)
-        rw, rh = scene.render.resolution_x, scene.render.resolution_y
-        w = min(rw, 1536) // 16 * 16
-        h = round(w * rh / rw) // 16 * 16
-        if (w, h) != (rw, rh):
-            scene.render.resolution_x, scene.render.resolution_y = w, h
-            self.report({'INFO'}, f"Resolution adjusted: {w}x{h}")
-
+        w, h = _fit_resolution(scene)
         _set_status("Rendering pass pack…")
         try:
             pack = _render_pack(context, [(z["name"], z["dilate"], z["blur"])
@@ -670,24 +777,193 @@ class COMFYDERPRO_OT_generate(bpy.types.Operator):
             mask_names = {m: _upload(host, path)
                           for m, path in pack["masks"].items()}
             graph = _build_graph(p, zones, depth_name, mask_names, w, h)
-            resp = _http_json(host + "/prompt",
-                              {"prompt": graph,
-                               "client_id": str(uuid.uuid4())}, timeout=60)
+            run_dir = _start_run(context, "full", zones)
+            _submit(context, graph, run_dir)
         except Exception as e:
-            self.report({'ERROR'}, f"ComfyUI: {str(e)[:80]}")
+            self.report({'ERROR'}, f"ComfyUI: {str(e)[:100]}")
             _set_status("")
             return {'CANCELLED'}
-        if resp.get("node_errors"):
-            self.report({'ERROR'}, str(resp["node_errors"])[:120])
-            _set_status("")
-            return {'CANCELLED'}
-
-        _JOB.update(prompt_id=resp["prompt_id"], host=host, t0=time.time(),
-                    scene=scene.name,
-                    out_dir=bpy.path.abspath(p.output_dir))
         _set_status(f"Submitted ({len(zones)} zones), waiting…")
-        if not bpy.app.timers.is_registered(_poll):
-            bpy.app.timers.register(_poll, first_interval=4.0)
+        return {'FINISHED'}
+
+
+# =================================================================== history/pin
+class COMFYDERPRO_OT_hist_refresh(bpy.types.Operator):
+    bl_idname = "comfyder_pro.hist_refresh"
+    bl_label = "Rescan history"
+    bl_description = "Rebuild the history list from run_* folders on disk"
+
+    def execute(self, context):
+        p = context.scene.comfyder_pro
+        base = bpy.path.abspath(p.output_dir)
+        p.hist.clear()
+        if os.path.isdir(base):
+            runs = sorted(d for d in os.listdir(base)
+                          if d.startswith("run_")
+                          and os.path.isdir(os.path.join(base, d)))
+            for run in runs[-40:]:
+                rd = os.path.join(base, run)
+                for f in sorted(os.listdir(rd)):
+                    if f.lower().endswith(".png"):
+                        step = f.split("_0000")[0]
+                        _hist_add(context.scene,
+                                  f"{run.replace('run_', '')} · {step}",
+                                  os.path.join(rd, f))
+        self.report({'INFO'}, f"History: {len(p.hist)} items")
+        return {'FINISHED'}
+
+
+class COMFYDERPRO_OT_hist_view(bpy.types.Operator):
+    bl_idname = "comfyder_pro.hist_view"
+    bl_label = "View"
+    bl_description = "Open the selected step in the Image Editor"
+
+    def execute(self, context):
+        p = context.scene.comfyder_pro
+        if not (0 <= p.hist_index < len(p.hist)):
+            return {'CANCELLED'}
+        it = p.hist[p.hist_index]
+        if not os.path.isfile(it.path):
+            self.report({'ERROR'}, "File is gone: " + it.path)
+            return {'CANCELLED'}
+        img = bpy.data.images.load(it.path, check_existing=True)
+        for w in context.window_manager.windows:
+            for a in w.screen.areas:
+                if a.type == 'IMAGE_EDITOR':
+                    a.spaces.active.image = img
+                    a.tag_redraw()
+                    return {'FINISHED'}
+        self.report({'INFO'}, "Open an Image Editor to view")
+        return {'FINISHED'}
+
+
+class COMFYDERPRO_OT_pin_set(bpy.types.Operator):
+    bl_idname = "comfyder_pro.pin_set"
+    bl_label = "Pin"
+    bl_description = ("Pin the selected step — iterate from it for cents. "
+                      "FAL is not deterministic: pin what you like")
+
+    def execute(self, context):
+        p = context.scene.comfyder_pro
+        if not (0 <= p.hist_index < len(p.hist)):
+            self.report({'ERROR'}, "Select a history item")
+            return {'CANCELLED'}
+        it = p.hist[p.hist_index]
+        p.pin_path = it.path
+        p.pin_label = it.label
+        return {'FINISHED'}
+
+
+class COMFYDERPRO_OT_pin_active(bpy.types.Operator):
+    bl_idname = "comfyder_pro.pin_active"
+    bl_label = "Pin active image"
+    bl_description = "Pin the image currently open in the Image Editor"
+
+    def execute(self, context):
+        img = None
+        sp = getattr(context, "space_data", None)
+        if sp is not None and getattr(sp, "image", None) is not None:
+            img = sp.image
+        if img is None or not img.filepath:
+            self.report({'ERROR'}, "Active image has no file on disk")
+            return {'CANCELLED'}
+        p = context.scene.comfyder_pro
+        p.pin_path = bpy.path.abspath(img.filepath)
+        p.pin_label = img.name
+        return {'FINISHED'}
+
+
+class COMFYDERPRO_OT_pin_clear(bpy.types.Operator):
+    bl_idname = "comfyder_pro.pin_clear"
+    bl_label = "Clear pin"
+
+    def execute(self, context):
+        p = context.scene.comfyder_pro
+        p.pin_path = ""
+        p.pin_label = ""
+        return {'FINISHED'}
+
+
+class COMFYDERPRO_OT_pin_zone(bpy.types.Operator):
+    bl_idname = "comfyder_pro.pin_zone"
+    bl_label = "Re-run active zone from Pin"
+    bl_description = ("Fresh mask for the active zone + its pass on top of "
+                      "the pinned frame (+ final if enabled). 1–2 API calls")
+
+    def execute(self, context):
+        p = context.scene.comfyder_pro
+        if _JOB.get("prompt_id"):
+            self.report({'WARNING'}, "A generation is already running")
+            return {'CANCELLED'}
+        if not p.pin_path or not os.path.isfile(p.pin_path):
+            self.report({'ERROR'}, "No pin — pin a step first")
+            return {'CANCELLED'}
+        if not (0 <= p.zone_index < len(p.zones)):
+            self.report({'ERROR'}, "Select a zone in the list")
+            return {'CANCELLED'}
+        mat = bpy.data.materials.get(p.zones[p.zone_index].name)
+        if mat is None or not mat.comfyder.prompt.strip():
+            self.report({'ERROR'}, "Zone material missing or prompt empty")
+            return {'CANCELLED'}
+        z = _zone_dict(mat)
+
+        w, h = _fit_resolution(context.scene)
+        _set_status("Rendering mask…")
+        try:
+            pack = _render_pack(context, [(z["name"], z["dilate"], z["blur"])])
+            host = p.host.rstrip("/")
+            pin_name = _upload(host, p.pin_path, "cp_pin.png")
+            mask_name = _upload(host, pack["masks"][z["name"]])
+            depth_name = (_upload(host, pack["depth"])
+                          if p.final_enabled else None)
+            graph = _build_pin_zone_graph(p, z, pin_name, mask_name,
+                                          depth_name, w, h)
+            run_dir = _start_run(context, f"pin-zone:{z['name']}", [z])
+            _submit(context, graph, run_dir)
+        except Exception as e:
+            self.report({'ERROR'}, str(e)[:100])
+            _set_status("")
+            return {'CANCELLED'}
+        _set_status(f"Zone {z['name']} from pin, waiting…")
+        return {'FINISHED'}
+
+
+class COMFYDERPRO_OT_pin_final(bpy.types.Operator):
+    bl_idname = "comfyder_pro.pin_final"
+    bl_label = "Final from Pin (mood)"
+    bl_description = ("Only the final Gemini pass (frame + depth + mood) "
+                      "on top of the pinned frame. 1 API call")
+
+    def execute(self, context):
+        p = context.scene.comfyder_pro
+        if _JOB.get("prompt_id"):
+            self.report({'WARNING'}, "A generation is already running")
+            return {'CANCELLED'}
+        if not p.pin_path or not os.path.isfile(p.pin_path):
+            self.report({'ERROR'}, "No pin — pin a step first")
+            return {'CANCELLED'}
+        zones = []
+        for z in p.zones:
+            mat = bpy.data.materials.get(z.name)
+            if mat and mat.comfyder.prompt.strip():
+                zones.append(_zone_dict(mat))
+
+        w, h = _fit_resolution(context.scene)
+        _set_status("Rendering depth…")
+        try:
+            pack = _render_pack(context, [])
+            host = p.host.rstrip("/")
+            pin_name = _upload(host, p.pin_path, "cp_pin.png")
+            depth_name = _upload(host, pack["depth"])
+            graph = _build_pin_final_graph(p, zones, pin_name, depth_name,
+                                           w, h)
+            run_dir = _start_run(context, "pin-final", zones)
+            _submit(context, graph, run_dir)
+        except Exception as e:
+            self.report({'ERROR'}, str(e)[:100])
+            _set_status("")
+            return {'CANCELLED'}
+        _set_status("Final from pin, waiting…")
         return {'FINISHED'}
 
 
@@ -705,6 +981,12 @@ class COMFYDERPRO_UL_zones(bpy.types.UIList):
             row.label(text=short)
         else:
             row.label(text=item.name + " (missing)", icon='ERROR')
+
+
+class COMFYDERPRO_UL_hist(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_prop, index):
+        layout.label(text=item.label, icon='RENDER_RESULT')
 
 
 def _wrap_preview(col, text, width=44, lines=5):
@@ -788,6 +1070,26 @@ def _draw(panel, context):
     lay.operator("comfyder_pro.generate", icon='PLAY')
     if p.status:
         lay.label(text=p.status)
+
+    box = lay.box()
+    box.label(text="History", icon='TIME')
+    box.template_list("COMFYDERPRO_UL_hist", "", p, "hist", p, "hist_index",
+                      rows=4)
+    row = box.row(align=True)
+    row.operator("comfyder_pro.hist_view", icon='HIDE_OFF')
+    row.operator("comfyder_pro.pin_set", icon='PINNED')
+    row.operator("comfyder_pro.hist_refresh", text="", icon='FILE_REFRESH')
+    box.operator("comfyder_pro.pin_active", icon='IMAGE_DATA')
+
+    if p.pin_path:
+        pb = lay.box()
+        pb.label(text="Pin: " + (p.pin_label or
+                                 os.path.basename(p.pin_path)),
+                 icon='PINNED')
+        pb.operator("comfyder_pro.pin_zone", icon='MATERIAL')
+        pb.operator("comfyder_pro.pin_final", icon='SHADERFX')
+        pb.operator("comfyder_pro.pin_clear", icon='X')
+
     lay.prop(p, "output_dir", text="")
     lay.prop(p, "host", text="")
 
@@ -813,11 +1115,17 @@ class COMFYDERPRO_PT_image(bpy.types.Panel):
 
 
 # =================================================================== reg
-classes = (ComfyderZoneSettings, ComfyderZoneRef, ComfyderProProps,
+classes = (ComfyderZoneSettings, ComfyderZoneRef, ComfyderHistItem,
+           ComfyderProProps,
            COMFYDERPRO_OT_zone_sync, COMFYDERPRO_OT_zone_add,
            COMFYDERPRO_OT_zone_remove, COMFYDERPRO_OT_zone_move,
            COMFYDERPRO_OT_build_prompt, COMFYDERPRO_OT_edit_text,
-           COMFYDERPRO_OT_generate, COMFYDERPRO_UL_zones,
+           COMFYDERPRO_OT_generate,
+           COMFYDERPRO_OT_hist_refresh, COMFYDERPRO_OT_hist_view,
+           COMFYDERPRO_OT_pin_set, COMFYDERPRO_OT_pin_active,
+           COMFYDERPRO_OT_pin_clear, COMFYDERPRO_OT_pin_zone,
+           COMFYDERPRO_OT_pin_final,
+           COMFYDERPRO_UL_zones, COMFYDERPRO_UL_hist,
            COMFYDERPRO_PT_view3d, COMFYDERPRO_PT_image)
 
 
